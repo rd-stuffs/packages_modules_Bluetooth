@@ -569,6 +569,8 @@ void btm_pin_code_reply(const RawAddress& bd_addr, tBTM_STATUS res, uint8_t pin_
   BtmSecurity::Get().change_pairing_state(BTM_PAIR_STATE_WAIT_AUTH_COMPLETE);
   acl_set_disconnect_reason(HCI_SUCCESS);
 
+  BtmSecurity::Get().pin_code_len_ = pin_len;
+  BtmSecurity::Get().pin_code_ = pin_code;
   btsnd_hcic_pin_code_req_reply(bd_addr, pin_len, pin_code);
 }
 
@@ -4475,7 +4477,8 @@ void btm_sec_pin_code_request(const RawAddress& bda) {
         BtmSecurity::Get().pairing_state_ == BTM_PAIR_STATE_WAIT_AUTH_COMPLETE) {
       btsnd_hcic_pin_code_neg_reply(bda);
       return;
-    } else if (BtmSecurity::Get().pairing_state_ != BTM_PAIR_STATE_WAIT_PIN_REQ ||
+    } else if ((BtmSecurity::Get().pairing_state_ != BTM_PAIR_STATE_WAIT_PIN_REQ &&
+                BtmSecurity::Get().pairing_state_ != BTM_PAIR_STATE_WAIT_LOCAL_PIN) ||
                bda != BtmSecurity::Get().link_spec_.addrt.bda) {
       log::warn("Rejected - state: {}", btm_pair_state_descr(BtmSecurity::Get().pairing_state_));
       btsnd_hcic_pin_code_neg_reply(bda);
@@ -4529,8 +4532,7 @@ void btm_sec_pin_code_request(const RawAddress& bda) {
   }
 
   /* We could have started connection after asking user for the PIN code */
-  if (!com_android_bluetooth_flags_security_mode_3_pairing() &&
-      BtmSecurity::Get().pin_code_len_ != 0) {
+  if (BtmSecurity::Get().pin_code_len_ != 0) {
     log::verbose("Sending reply");
     btsnd_hcic_pin_code_req_reply(bda, BtmSecurity::Get().pin_code_len_,
                                   BtmSecurity::Get().pin_code_);
@@ -4544,6 +4546,7 @@ void btm_sec_pin_code_request(const RawAddress& bda) {
     btm_restore_mode(); */
 
     BtmSecurity::Get().change_pairing_state(BTM_PAIR_STATE_WAIT_AUTH_COMPLETE);
+    return;
   } else if (BtmSecurity::Get().pairing_disabled_ ||
              (!p_device->IsLocallyInitiated() &&
               ((p_device->dev_class[1] & BTM_COD_MAJOR_CLASS_MASK) == BTM_COD_MAJOR_PERIPHERAL) &&
@@ -4573,12 +4576,13 @@ void btm_sec_pin_code_request(const RawAddress& bda) {
     if (p_device->sec_rec.sec_flags & BTM_SEC_NAME_KNOWN) {
       log::verbose("Going for callback");
 
-      BtmSecurity::Get().pairing_flags_ |= BTM_PAIR_FLAGS_PIN_REQD;
-      (BtmSecurity::Get().app_->pin_callback)(
-              bda, p_device->dev_class, p_device->sec_bd_name,
-              p_device->sec_rec.required_security_flags_for_pairing & BTM_SEC_IN_MIN_16_DIGIT_PIN,
-              p_device->sec_rec.pairing_algorithm);
-
+      if ((BtmSecurity::Get().pairing_flags_ & BTM_PAIR_FLAGS_PIN_REQD) == 0) {
+        BtmSecurity::Get().pairing_flags_ |= BTM_PAIR_FLAGS_PIN_REQD;
+        (BtmSecurity::Get().app_->pin_callback)(
+                bda, p_device->dev_class, p_device->sec_bd_name,
+                p_device->sec_rec.required_security_flags_for_pairing & BTM_SEC_IN_MIN_16_DIGIT_PIN,
+                p_device->sec_rec.pairing_algorithm);
+      }
     } else {
       log::verbose("Going for remote name");
 
@@ -4907,8 +4911,7 @@ static void btm_send_link_key_notif(BtmDevice* p_device) {
  *
  ******************************************************************************/
 static void btm_restore_mode(void) {
-  if (!com_android_bluetooth_flags_security_mode_3_pairing() &&
-      BtmSecurity::Get().security_mode_changed_) {
+  if (BtmSecurity::Get().security_mode_changed_) {
     BtmSecurity::Get().security_mode_changed_ = false;
     btsnd_hcic_write_auth_enable(false);
   }
@@ -5273,14 +5276,6 @@ void btm_sec_set_peer_sec_caps(uint16_t hci_handle, bool ssp_supported, bool hos
 
   uint8_t req_pend = (p_device->sm4 & BTM_SM4_REQ_PEND);
 
-  if (!(p_device->sec_rec.sec_flags & BTM_SEC_NAME_KNOWN) || p_device->outgoing) {
-    tBTM_STATUS btm_status = btm_sec_execute_procedure(p_device);
-    if (btm_status != tBTM_STATUS::BTM_CMD_STARTED) {
-      log::warn("Security procedure not started! status:{}", btm_status_text(btm_status));
-      btm_sec_dev_rec_cback_event(p_device, btm_status, false);
-    }
-  }
-
   /* Store the Peer Security Capabilities (in SM4 and rmt_sec_caps) */
   if ((BtmSecurity::Get().security_mode_ == BTM_SEC_MODE_SP ||
        BtmSecurity::Get().security_mode_ == BTM_SEC_MODE_SC) &&
@@ -5297,17 +5292,54 @@ void btm_sec_set_peer_sec_caps(uint16_t hci_handle, bool ssp_supported, bool hos
   // To determine the pairing algorithm, check remote device features, and local controller
   // features. For local host, refer to local support bits, locally SC supported.
   if (!p_device->sec_rec.is_bonded()) {
-    if (bluetooth::shim::GetController()->SupportsSecureConnections()) {
-      if (p_device->remote_host_supports_secure_connections &&
+    if (ssp_supported) {
+      if (bluetooth::shim::GetController()->SupportsSecureConnections() &&
+          p_device->remote_host_supports_secure_connections &&
           p_device->remote_controller_supports_secure_connections) {
         p_device->sec_rec.pairing_algorithm = PairingAlgorithm::SC;
       } else {
         p_device->sec_rec.pairing_algorithm = PairingAlgorithm::SSP;
       }
-    } else if (bluetooth::shim::GetController()->SupportsSimplePairing()) {
-      p_device->sec_rec.pairing_algorithm = PairingAlgorithm::SSP;
     } else {
       p_device->sec_rec.pairing_algorithm = PairingAlgorithm::BREDR_LEGACY;
+    }
+  }
+
+  if (!ssp_supported &&
+      ((BtmSecurity::Get().pairing_state_ == BTM_PAIR_STATE_WAIT_PIN_REQ) ||
+       (BtmSecurity::Get().pairing_flags_ & BTM_PAIR_FLAGS_WE_STARTED_DD)) &&
+      (BtmSecurity::Get().link_spec_.addrt.bda == p_device->bd_addr)) {
+    log::info("Peer does not support SSP, initiating legacy PIN pairing for {}", p_device->bd_addr);
+    p_device->sec_rec.pairing_algorithm = PairingAlgorithm::BREDR_LEGACY;
+    BtmSecurity::Get().change_pairing_state(BTM_PAIR_STATE_WAIT_LOCAL_PIN);
+
+    uint8_t major = (uint8_t)(p_device->dev_class[1] & BTM_COD_MAJOR_CLASS_MASK);
+    uint8_t minor = (uint8_t)(p_device->dev_class[2] & BTM_COD_MINOR_CLASS_MASK);
+    if (major == BTM_COD_MAJOR_AUDIO &&
+        (minor == BTM_COD_MINOR_CONFM_HANDSFREE || minor == BTM_COD_MINOR_CAR_AUDIO)) {
+      if (!BtmSecurity::Get().security_mode_changed_) {
+        BtmSecurity::Get().security_mode_changed_ = true;
+        btsnd_hcic_write_auth_enable(true);
+      }
+    }
+
+    if (p_device->sec_rec.sec_flags & BTM_SEC_NAME_KNOWN) {
+      if ((BtmSecurity::Get().pairing_flags_ & BTM_PAIR_FLAGS_PIN_REQD) == 0) {
+        log::verbose("calling pin_callback for legacy peer");
+        BtmSecurity::Get().pairing_flags_ |= BTM_PAIR_FLAGS_PIN_REQD;
+        (BtmSecurity::Get().app_->pin_callback)(
+                p_device->bd_addr, p_device->dev_class, p_device->sec_bd_name,
+                p_device->sec_rec.required_security_flags_for_pairing & BTM_SEC_IN_MIN_16_DIGIT_PIN,
+                p_device->sec_rec.pairing_algorithm);
+      }
+    }
+  }
+
+  if (!(p_device->sec_rec.sec_flags & BTM_SEC_NAME_KNOWN) || p_device->outgoing) {
+    tBTM_STATUS btm_status = btm_sec_execute_procedure(p_device);
+    if (btm_status != tBTM_STATUS::BTM_CMD_STARTED) {
+      log::warn("Security procedure not started! status:{}", btm_status_text(btm_status));
+      btm_sec_dev_rec_cback_event(p_device, btm_status, false);
     }
   }
 
